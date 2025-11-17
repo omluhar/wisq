@@ -1,4 +1,3 @@
-# resynth.py
 from bqskit import compile, Circuit, MachineModel
 from bqskit.ir.gates import (
     CXGate,
@@ -38,10 +37,7 @@ import json
 import platform
 from functools import partial
 import sys
-
-# Additional imports for splitting/parallelizing
 from concurrent.futures import ThreadPoolExecutor
-from qiskit.converters import dag_to_circuit, circuit_to_dag
 
 LIB_DIR = os.path.join(os.path.dirname(__file__), "lib")
 
@@ -100,11 +96,9 @@ class Circuit:
             for replace_gate in NON_STANDARD_GATES:
                 if (
                     gate[0].name == NON_STANDARD_GATES[replace_gate][0].split("(")[0]
-                    and gate[0].params
-                    and len(gate[0].params) > 0
                     and gate[0].params[0] == np.pi
                 ):
-                    # set gate to the correct gate operator (for nonstandard gates)
+                    # set gate to the correct gate
                     self.circuit.data[index] = (
                         NON_STANDARD_GATES[replace_gate][1],
                         gate[1],
@@ -112,11 +106,7 @@ class Circuit:
                     )
 
         self.filename = filename
-        # filename expected to contain score/count in original repo; keep compatibility
-        try:
-            self.score = float(os.path.basename(filename).split("-")[0])
-        except Exception:
-            self.score = 0.0
+        self.score = float(os.path.basename(filename).split("-")[0])
         self.t_depth = self.circuit.depth(lambda gate: gate[0].name in ["t", "tdg"])
         self.cx_depth = self.circuit.depth(lambda gate: gate[0].name == "cx")
         self.cx_count = np.count_nonzero(
@@ -126,10 +116,7 @@ class Circuit:
         self.t_count = np.count_nonzero(gates_names == "t") + np.count_nonzero(
             gates_names == "tdg"
         )
-        try:
-            self.count = float(os.path.basename(filename).split("-")[1])
-        except Exception:
-            self.count = 0.0
+        self.count = float(os.path.basename(filename).split("-")[1])
         self.gates = len(gates_names)
 
 
@@ -146,6 +133,21 @@ def main_analysis(circuit_folder):
         gates.append(circuit.gates)
         t_count.append(circuit.t_count)
 
+        # if best_t_depth_circ is None:
+        #     best_t_depth_circ = circuit
+        # condition2 = circuit.t_depth < best_t_depth_circ.t_depth
+        # condition3 = (
+        #     circuit.t_depth == best_t_depth_circ.t_depth
+        #     and circuit.t_count < best_t_depth_circ.t_count
+        # )
+        # condition4 = (
+        #     circuit.t_depth == best_t_depth_circ.t_depth
+        #     and circuit.t_count == best_t_depth_circ.t_count
+        #     and circuit.score < best_t_depth_circ.score
+        # )
+        # if condition2 or condition3 or condition4:
+        #     best_t_depth_circ = circuit
+
         if best_t_count_circ is None:
             best_t_count_circ = circuit
         condition2 = circuit.t_count < best_t_count_circ.t_count
@@ -161,6 +163,22 @@ def main_analysis(circuit_folder):
         if condition2 or condition3 or condition4:
             best_t_count_circ = circuit
 
+        # do the same for cx depth
+        # if best_cx_depth_circ is None:
+        #     best_cx_depth_circ = circuit
+        # condition2 = circuit.cx_depth < best_cx_depth_circ.cx_depth
+        # condition3 = (
+        #     circuit.cx_depth == best_cx_depth_circ.cx_depth
+        #     and circuit.cx_count < best_cx_depth_circ.cx_count
+        # )
+        # condition4 = (
+        #     circuit.cx_depth == best_cx_depth_circ.cx_depth
+        #     and circuit.cx_count == best_cx_depth_circ.cx_count
+        #     and circuit.score < best_cx_depth_circ.score
+        # )
+        # if condition2 or condition3 or condition4:
+        #     best_cx_depth_circ = circuit
+
     t_depth = np.array(t_depth)
     t_count = np.array(t_count)
     gates = np.array(gates)
@@ -174,7 +192,7 @@ def main_analysis(circuit_folder):
     )
 
 
-# end analyzer
+# end code from https://github.com/eth-sri/synthetiq/blob/main/notebooks/post_processing/analyzer.py
 
 warnings.filterwarnings("ignore")
 
@@ -184,150 +202,58 @@ GATE_SET_DICT = {
     "ion": {RXXGate(), RZGate(), RXGate(), RYGate()},
 }
 
-
-# ------------------------------
-# New: Splitting / Parallel optimizing / Combining pipeline
-# ------------------------------
-MAX_BQSKIT_QUBITS = 7  # BQSKit max
-
-def split_circuit_by_qubits(qc: QuantumCircuit, target_chunk_size: int = 30):
-    if len(qc.data) == 0:
-        return []
-
-    total_gates = len(qc.data)
-    subcircuits = []
-    start = 0
-
-    while start < total_gates:
-        block_size = target_chunk_size
-        gates_block = qc.data[start:start + block_size]
-
-        # find qubits used in this block
-        qubits_in_block = []
-        for instr, qargs, _ in gates_block:
-            for q in qargs:
-                if q not in qubits_in_block:
-                    qubits_in_block.append(q)
-        # split if too many qubits
-        if len(qubits_in_block) > MAX_BQSKIT_QUBITS:
-            qubits_in_block = qubits_in_block[:MAX_BQSKIT_QUBITS]
-
-        sub_qc = QuantumCircuit(len(qubits_in_block))
-        qubit_map = {q: idx for idx, q in enumerate(qubits_in_block)}
-
-        # add only gates that use qubits within the allowed set
-        for instr, qargs, cargs in gates_block:
-            if all(q in qubit_map for q in qargs):
-                sub_qc.append(instr, [qubit_map[q] for q in qargs], cargs)
-
-        subcircuits.append((sub_qc, qubits_in_block))
-        start += block_size
-
-    print(f"[Split] Total gates={total_gates}. Created {len(subcircuits)} subcircuits.")
-    return subcircuits
-
-
-def optimize_subcircuits_parallel(
-    compiler,
-    subcircuits,
-    opt_level: int = 2,
-    epsilon: float = 1e-6,
-    target_gateset: str = "ibm_new",
-    max_workers: int | None = None,
-):
+def split_qasm_into_unitary_chunks(qasm_str):
     """
-    Optimizes subcircuits in parallel.
-    Each item in `subcircuits` is a tuple (QuantumCircuit, qubit_list)
-    Returns list of (optimized_subcircuit, qubit_list)
+    Splits a QASM string into chunks separated by barriers or multi-qubit operations.
+    Each chunk will be optimized independently.
     """
-    if not subcircuits:
-        return []
+    qc = QuantumCircuit.from_qasm_str(qasm_str)
+    chunks = []
+    current_chunk = QuantumCircuit(*qc.qregs)
+    
+    for gate, qargs, cargs in qc.data:
+        current_chunk.append(gate, qargs, cargs)
+        # Split at multi-qubit gates or barriers
+        if len(qargs) > 1 or gate.name == "barrier":
+            chunks.append(current_chunk)
+            current_chunk = QuantumCircuit(*qc.qregs)
+    
+    # Add any remaining operations
+    if len(current_chunk.data) > 0:
+        chunks.append(current_chunk)
+    
+    return chunks
 
-    def do_opt(item):
-        sub_qc, qubits_in_block = item
-        qasm_str = qasm2.dumps(sub_qc)
-        optimized_qasm = bqskit_io(compiler, {}, qasm_str, opt_level, epsilon, target_gateset)
-        optimized_qc = QuantumCircuit.from_qasm_str(optimized_qasm)
-        return (optimized_qc, qubits_in_block)
 
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        results = list(ex.map(do_opt, subcircuits))
+def optimize_chunks_in_parallel(chunks, compiler, opt_level, epsilon, target_gateset, max_workers=4):
+    """
+    Runs bqskit_io on each chunk in parallel and returns a list of optimized QASM strings.
+    """
+    optimized_qasms = []
 
-    print(f"[Optimize] Optimized {len(results)} subcircuits (parallel).")
+    def optimize_chunk(chunk):
+        qasm_str = qasm2.dumps(chunk)
+        optimized = bqskit_io(compiler, {}, qasm_str, opt_level, epsilon, target_gateset)
+        return QuantumCircuit.from_qasm_str(optimized)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        results = list(executor.map(optimize_chunk, chunks))
+    
     return results
 
 
-
-def combine_subcircuits(subcircuits_with_qubits, total_qubits):
+def combine_optimized_chunks(chunks):
     """
-    Combine subcircuits into a single circuit with `total_qubits` qubits.
-    subcircuits_with_qubits: list of (QuantumCircuit, qubit_list)
+    Combines optimized QuantumCircuit chunks into a single final circuit.
     """
-    combined = QuantumCircuit(total_qubits)
-    for sub, qubits_in_block in subcircuits_with_qubits:
-        # map back to original qubits
-        combined.compose(sub, qubits=qubits_in_block, inplace=True)
-    print(f"[Combine] Recombined circuit has {combined.size()} total gates.")
-    return combined
+    if len(chunks) == 0:
+        return None
+    final_circuit = QuantumCircuit(*chunks[0].qregs)
+    for chunk in chunks:
+        for gate, qargs, cargs in chunk.data:
+            final_circuit.append(gate, qargs, cargs)
+    return final_circuit
 
-
-# ------------------------------
-# Test helper that checks equivalence (unitary) between original and combined
-# ------------------------------
-def test_parallel_optimizer(
-    compiler=None,
-    target_gateset="ibm_new",
-    target_chunk_size=15,  # smaller chunk size ensures multiple subcircuits
-    num_qubits=5,
-    num_layers=20          # reduce layers to keep unitary small enough for BQSKit
-):
-    """
-    Generate a test circuit, split -> parallel-optimize -> combine,
-    and check unitary equivalence.
-    """
-    print(f"[Test] Building test circuit with {num_qubits} qubits and {num_layers} layers.")
-    qc = QuantumCircuit(num_qubits)
-
-    # Fixed, repeatable pattern of gates
-    for _ in range(num_layers):
-        for q in range(num_qubits):
-            qc.h(q)
-            qc.rz(np.pi / 4, q)
-        for q in range(num_qubits - 1):
-            qc.cx(q, q + 1)
-
-    print(f"[Test] Generated circuit with {len(qc.data)} gates.")
-
-    # Split circuit into subcircuits
-    subs = split_circuit_by_qubits(qc, target_chunk_size=target_chunk_size)
-    print(f"[Test] Created {len(subs)} subcircuits (each <= {target_chunk_size} gates).")
-
-    if len(subs) < 2:
-        print("[Warning] Only one subcircuit was created. Consider reducing target_chunk_size.")
-
-    # Optimize subcircuits in parallel
-    optimized_subs = optimize_subcircuits_parallel(
-        compiler, subs, opt_level=2, epsilon=1e-8, target_gateset=target_gateset
-    )
-
-    # Combine optimized subcircuits
-    combined = combine_subcircuits(optimized_subs, total_qubits=num_qubits)
-
-    # Check unitary equivalence
-    orig_op = Operator(qc).data
-    combined_op = Operator(combined).data
-    max_diff = np.max(np.abs(orig_op - combined_op))
-    equivalent = np.allclose(orig_op, combined_op, atol=1e-6)
-
-    print(f"[Test] Max unitary difference: {max_diff:.3e}")
-    print("[Test] Equivalent?" , "YES" if equivalent else "NO")
-
-    return combined
-
-
-# ------------------------------
-# Existing bqskit_io, synthetiq_disk, server code unchanged (except we now call the new pipeline)
-# ------------------------------
 def bqskit_io(compiler, data, circuit_str, opt_level, epsilon, target_gateset):
     qc = QuantumCircuit.from_qasm_str(circuit_str)
     data["circuit"] = circuit_str
@@ -467,14 +393,17 @@ class MyHandler(BaseHTTPRequestHandler):
             parsed_body = json.loads(body)
             time1 = time.time()
             data = {}
-            output = bqskit_io(
+            chunks = split_qasm_into_unitary_chunks(parsed_body["circuit"])
+            optimized_chunks = optimize_chunks_in_parallel(
+                chunks,
                 self.compiler,
-                data,
-                parsed_body["circuit"],
                 int(parsed_body["opt_level"]),
                 float(parsed_body["epsilon"]),
-                parsed_body["target_gateset"],
+                parsed_body["target_gateset"]
             )
+            final_circuit = combine_optimized_chunks(optimized_chunks)
+            output = qasm2.dumps(final_circuit)
+            data["resynthesized_circuit"] = output
             data["resynthesized_circuit"] = output
             time2 = time.time()
             data["time"] = time2 - time1
@@ -549,31 +478,6 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    # Initialize Compiler if requested by server mode
-    if args.bqskit:
-        # If user passed --bqskit, we will create a Compiler for server endpoints to use.
-        # Note: test below will also create a Compiler for the parallel test.
-        server_compiler = Compiler()
-    else:
-        server_compiler = None
-
-    # Run the parallel optimizer test (uses Compiler if available)
-    print("[Main] Running parallel optimizer test (small circuit) ...")
-    # create a Compiler for the test run regardless (keeps behavior similar to original script)
-    try:
-        test_compiler = Compiler()
-    except Exception:
-        test_compiler = None
-    combined_qc = test_parallel_optimizer(
-        test_compiler,
-        target_gateset="ibm_new",
-        target_chunk_size=30,
-        num_qubits=5,   # Adjust as needed
-        num_layers=50   # Adjust layers to make circuit bigger
-    )
-    print("[Main] Test finished. Combined circuit size:", combined_qc.size())
-
-    # Start server (same behavior as original file)
     start_server(
         args.bqskit,
         args.bqskit_auto_workers,
